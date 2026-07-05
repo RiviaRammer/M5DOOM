@@ -1,0 +1,17 @@
+# ESP-IDF build outputs
+**/build/
+**/build_*/
+**/managed_components/
+**/dependencies/
+**/dependencies.lock
+**/sdkconfig.old
+**/.cache/
+
+# Local reference projects; Tab5DOOM is self-contained.
+esp32-doom/
+M5Tab5-UserDemo/
+
+# Editor/system files
+**/.vscode/
+.DS_Store
+Thumbs.db

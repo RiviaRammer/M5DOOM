@@ -1,0 +1,4 @@
+version: "1.0.0"
+description: ESP LCD ST7121 panel driver
+dependencies:
+  idf: ">=5.4"

@@ -1,0 +1,16 @@
+build/
+build_*/
+managed_components/
+dependencies/
+dependencies.lock
+sdkconfig.old
+.cache/
+.vscode/
+
+*.o
+*.elf
+*.bin
+*.map
+*.log
+
+components/prboom/native/doom

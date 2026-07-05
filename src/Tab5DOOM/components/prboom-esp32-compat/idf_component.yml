@@ -1,0 +1,5 @@
+dependencies:
+  espressif/m5stack_tab5:
+    version: "^1.0.0"
+    rules:
+      - if: "target in [esp32p4]"
