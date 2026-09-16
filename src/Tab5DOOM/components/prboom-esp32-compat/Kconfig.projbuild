@@ -152,6 +152,15 @@ config HW_TAB5_TOUCH_ENA
 	help
 		Use touch zones as a virtual Doom controller.
 
+config HW_TAB5_PPA_ENA
+	bool "Use PPA for M5Stack Tab5 scaling"
+	default y
+	depends on HW_M5STACK_TAB5
+	help
+		Accelerate 3x scaling and rotation with the PPA. Disable for a CPU-only
+		comparison when investigating LCD underruns. Both paths produce the
+		same RGB565 image size and orientation. PPA errors fall back to CPU.
+
 
 config HW_PSX_CLK
 	int "PSX controller CLK GPIO pin"

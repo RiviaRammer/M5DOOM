@@ -167,16 +167,29 @@ mapthing_t playerstarts[MAXPLAYERS];
 // P_CheckForZDoomNodes
 //
 
-static boolean P_CheckForZDoomNodes(int lumpnum, int gl_lumpnum)
+static int P_ReadLumpHeader(int lumpnum)
 {
   const void *data;
+  int header = 0;
 
-  data = W_CacheLumpNum(lumpnum + ML_NODES);
-  if (*(const int *)data == ZNOD)
+  if (lumpnum < 0 || lumpnum >= numlumps ||
+      W_LumpLength(lumpnum) < (int)sizeof(header))
+    return 0;
+
+  data = W_CacheLumpNum(lumpnum);
+  memcpy(&header, data, sizeof(header));
+  W_UnlockLumpNum(lumpnum);
+  return header;
+}
+
+static boolean P_CheckForZDoomNodes(int lumpnum, int gl_lumpnum)
+{
+  (void)gl_lumpnum;
+
+  if (P_ReadLumpHeader(lumpnum + ML_NODES) == ZNOD)
     I_Error("P_CheckForZDoomNodes: ZDoom nodes not supported yet");
 
-  data = W_CacheLumpNum(lumpnum + ML_SSECTORS);
-  if (*(const int *)data == ZGLN)
+  if (P_ReadLumpHeader(lumpnum + ML_SSECTORS) == ZGLN)
     I_Error("P_CheckForZDoomNodes: ZDoom GL nodes not supported yet");
 
   return false;
@@ -188,13 +201,12 @@ static boolean P_CheckForZDoomNodes(int lumpnum, int gl_lumpnum)
 
 static void P_GetNodesVersion(int lumpnum, int gl_lumpnum)
 {
-  const void *data;
-
-  data = W_CacheLumpNum(gl_lumpnum+ML_GL_VERTS);
   if ( (gl_lumpnum > lumpnum) && (forceOldBsp == false) && (compatibility_level >= prboom_2_compatibility) ) {
-    if (*(const int *)data == gNd2) {
-      data = W_CacheLumpNum(gl_lumpnum+ML_GL_SEGS);
-      if (*(const int *)data == gNd3) {
+    int header = P_ReadLumpHeader(gl_lumpnum + ML_GL_VERTS);
+
+    if (header == gNd2) {
+      header = P_ReadLumpHeader(gl_lumpnum + ML_GL_SEGS);
+      if (header == gNd3) {
         nodesVersion = gNd3;
         lprintf(LO_DEBUG, "P_GetNodesVersion: found version 3 nodes\n");
         I_Error("P_GetNodesVersion: version 3 nodes not supported\n");
@@ -203,12 +215,12 @@ static void P_GetNodesVersion(int lumpnum, int gl_lumpnum)
         lprintf(LO_DEBUG, "P_GetNodesVersion: found version 2 nodes\n");
       }
     }
-    if (*(const int *)data == gNd4) {
+    if (header == gNd4) {
       nodesVersion = gNd4;
       lprintf(LO_DEBUG, "P_GetNodesVersion: found version 4 nodes\n");
       I_Error("P_GetNodesVersion: version 4 nodes not supported\n");
     }
-    if (*(const int *)data == gNd5) {
+    if (header == gNd5) {
       nodesVersion = gNd5;
       lprintf(LO_DEBUG, "P_GetNodesVersion: found version 5 nodes\n");
       I_Error("P_GetNodesVersion: version 5 nodes not supported\n");

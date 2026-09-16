@@ -136,12 +136,15 @@ const void* W_CacheLumpNum(int lump)
 const void* W_LockLumpNum(int lump)
 {
   size_t len = W_LumpLength(lump);
-  const void *data = W_CacheLumpNum(lump);
 
   if (!cachelump[lump].cache) {
+    const void *data = W_CacheLumpNum(lump);
+
     // read the lump in
     Z_Malloc(len, PU_CACHE, &cachelump[lump].cache);
     memcpy(cachelump[lump].cache, data, len);
+    // The copied data no longer needs to occupy a flash mmap reference.
+    I_Munmap((void *)data, len);
   }
 
   /* cph - if wasn't locked but now is, tell z_zone to hold it */
@@ -184,4 +187,3 @@ void W_UnlockLumpNum(int lump) {
   if (cachelump[lump].locks == 0)
     Z_ChangeTag(cachelump[lump].cache, PU_CACHE);
 }
-

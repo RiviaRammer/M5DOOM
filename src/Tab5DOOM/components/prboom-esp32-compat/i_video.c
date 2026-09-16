@@ -103,8 +103,11 @@ void I_StartFrame (void)
 
 int I_StartDisplay(void)
 {
+	if (!spi_lcd_frame_due()) {
+		return false;
+	}
 	spi_lcd_wait_finish();
-  return true;
+	return true;
 }
 
 void I_EndDisplay(void)
@@ -122,7 +125,7 @@ static uint16_t *screena, *screenb;
 
 void I_FinishUpdate (void)
 {
-	uint16_t *scr=(uint16_t*)screens[0].data;
+	const uint8_t *scr=screens[0].data;
 #if 0
 	int x, y;
 	char *chrs=" '.~+mM@";
@@ -141,16 +144,16 @@ void I_FinishUpdate (void)
 //	if (scr==screena) screens[0].data=screenb; else screens[0].data=screena;
 }
 
-int16_t lcdpal[256];
+uint16_t lcdpal[256];
 
 void I_SetPalette (int pal)
 {
-	int i, r, g, b, v;
+	int i;
 	int pplump = W_GetNumForName("PLAYPAL");
 	const byte * palette = W_CacheLumpNum(pplump);
 	palette+=pal*(3*256);
-	for (i=0; i<255 ; i++) {
-		v=((palette[0]>>3)<<11)+((palette[1]>>2)<<5)+(palette[2]>>3);
+	for (i=0; i<256 ; i++) {
+		uint16_t v=((palette[0]>>3)<<11)+((palette[1]>>2)<<5)+(palette[2]>>3);
 #if CONFIG_HW_M5STACK_TAB5
 		lcdpal[i]=v;
 #else
@@ -187,8 +190,8 @@ void I_SetRes(void)
 
 //  I_CalculateRes(SCREENWIDTH, SCREENHEIGHT);
 
-  // set first three to standard values
-  for (i=0; i<3; i++) {
+  // screens 2 and 3 are allocated on demand by the wipe code.
+  for (i=0; i<2; i++) {
     screens[i].width = SCREENWIDTH;
     screens[i].height = SCREENHEIGHT;
     screens[i].byte_pitch = SCREENPITCH;

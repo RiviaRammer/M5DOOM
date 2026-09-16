@@ -17,49 +17,243 @@
 #if CONFIG_HW_M5STACK_TAB5
 
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "driver/ppa.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
+#include "tab5_helpers.h"
 
-#define DOOM_W 320
-#define DOOM_H 240
-#define TAB5_SCALE 3
+#define DOOM_W TAB5_DOOM_WIDTH
+#define DOOM_H TAB5_DOOM_HEIGHT
+#define TAB5_SCALE TAB5_DOOM_SCALE
 #define TAB5_FB_W (DOOM_W * TAB5_SCALE)
 #define TAB5_FB_H (DOOM_H * TAB5_SCALE)
+#define TAB5_OUT_W TAB5_FB_H
+#define TAB5_OUT_H TAB5_FB_W
+#define TAB5_FRAME_INTERVAL_MS 50
+#define TAB5_NATIVE_FB_SIZE (DOOM_W * DOOM_H * sizeof(uint16_t))
+#define TAB5_SCALED_FB_SIZE (TAB5_OUT_W * TAB5_OUT_H * sizeof(uint16_t))
+#define TAB5_FB_ALIGNMENT \
+    ((CONFIG_CACHE_L1_CACHE_LINE_SIZE > CONFIG_CACHE_L2_CACHE_LINE_SIZE) ? \
+     CONFIG_CACHE_L1_CACHE_LINE_SIZE : CONFIG_CACHE_L2_CACHE_LINE_SIZE)
 
 static const char *TAG = "tab5_lcd";
 static SemaphoreHandle_t frameMutex;
+static lv_display_t *doom_disp;
 static lv_obj_t *doom_img;
-static uint16_t *scaled_fb[2];
+static lv_obj_t *diagnostic_label;
+/* Updated and consumed by the Doom task, never by the LVGL task. */
+static unsigned diagnostic_mode;
+static bool diagnostic_pattern_pending;
+static bool diagnostic_refresh_pending;
+static const char *diagnostic_names[] = {
+    "T: display test", "TEST 1: STATIC REDRAW", "TEST 2: STATIC HOLD"
+};
+static uint16_t *scaled_fb[3];
+static uint32_t *native_fb;
+static ppa_client_handle_t scale_ppa;
+static bool ppa_scale_enabled;
 static int scaled_fb_idx;
+static TickType_t next_frame_tick;
+static bool frame_deadline_valid;
+static TickType_t last_stats_tick;
+static bool stats_window_valid;
+static uint32_t sent_frames;
+static uint32_t skipped_frames;
+static uint32_t processed_frames;
+static uint32_t cpu_scaled_frames;
+static uint32_t ppa_failures;
+static uint64_t scale_time_total_us;
+static uint64_t refresh_time_total_us;
+static uint32_t scale_time_max_us;
+static uint32_t refresh_time_max_us;
 
-extern int16_t lcdpal[256];
+extern uint16_t lcdpal[256];
 
 #if LVGL_VERSION_MAJOR >= 9
-static lv_image_dsc_t doom_img_dsc = {
-    .header.magic = LV_IMAGE_HEADER_MAGIC,
-    .header.cf = LV_COLOR_FORMAT_RGB565,
-    .header.w = TAB5_FB_W,
-    .header.h = TAB5_FB_H,
-    .header.stride = TAB5_FB_W * 2,
-    .data_size = TAB5_FB_W * TAB5_FB_H * 2,
-};
+static lv_image_dsc_t doom_img_dsc[3];
 #else
-static lv_img_dsc_t doom_img_dsc = {
-    .header.always_zero = 0,
-    .header.cf = LV_IMG_CF_TRUE_COLOR,
-    .header.w = TAB5_FB_W,
-    .header.h = TAB5_FB_H,
-    .data_size = TAB5_FB_W * TAB5_FB_H * 2,
-};
+static lv_img_dsc_t doom_img_dsc[3];
 #endif
+
+static void tab5_lcd_init_img_dsc(int idx, const uint8_t *data)
+{
+#if LVGL_VERSION_MAJOR >= 9
+    doom_img_dsc[idx].header.magic = LV_IMAGE_HEADER_MAGIC;
+    doom_img_dsc[idx].header.cf = LV_COLOR_FORMAT_RGB565;
+    doom_img_dsc[idx].header.w = TAB5_OUT_W;
+    doom_img_dsc[idx].header.h = TAB5_OUT_H;
+    doom_img_dsc[idx].header.stride = TAB5_OUT_W * 2;
+    doom_img_dsc[idx].data_size = TAB5_SCALED_FB_SIZE;
+    doom_img_dsc[idx].data = data;
+#else
+    doom_img_dsc[idx].header.always_zero = 0;
+    doom_img_dsc[idx].header.cf = LV_IMG_CF_TRUE_COLOR;
+    doom_img_dsc[idx].header.w = TAB5_OUT_W;
+    doom_img_dsc[idx].header.h = TAB5_OUT_H;
+    doom_img_dsc[idx].data_size = TAB5_SCALED_FB_SIZE;
+    doom_img_dsc[idx].data = data;
+#endif
+}
+
+static void tab5_lcd_log_stats(TickType_t now)
+{
+    if (!stats_window_valid) {
+        last_stats_tick = now;
+        stats_window_valid = true;
+        return;
+    }
+
+    if ((uint32_t)(now - last_stats_tick) < pdMS_TO_TICKS(5000)) {
+        return;
+    }
+
+    uint32_t window_ms = (uint32_t)(now - last_stats_tick) * portTICK_PERIOD_MS;
+    uint32_t fps_x100 = (uint32_t)((uint64_t)sent_frames * 100000 / window_ms);
+    ESP_LOGI(TAG,
+             "frames sent=%" PRIu32 " skipped=%" PRIu32
+             " window=%" PRIu32 "ms fps=%" PRIu32 ".%02" PRIu32
+             " cpu_scale=%" PRIu32 " ppa_fail=%" PRIu32 " diag=%u"
+             " scale=%" PRIu64 "/%" PRIu32 "us refresh=%" PRIu64 "/%" PRIu32
+             "us free_int=%u free_psram=%u",
+             sent_frames,
+             skipped_frames,
+             window_ms,
+             fps_x100 / 100,
+             fps_x100 % 100,
+             cpu_scaled_frames,
+             ppa_failures,
+             diagnostic_mode,
+             processed_frames ? scale_time_total_us / processed_frames : 0,
+             scale_time_max_us,
+             sent_frames ? refresh_time_total_us / sent_frames : 0,
+             refresh_time_max_us,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    sent_frames = 0;
+    skipped_frames = 0;
+    processed_frames = 0;
+    cpu_scaled_frames = 0;
+    ppa_failures = 0;
+    scale_time_total_us = 0;
+    refresh_time_total_us = 0;
+    scale_time_max_us = 0;
+    refresh_time_max_us = 0;
+    last_stats_tick = now;
+}
+
+static void tab5_lcd_scale_cpu(const uint8_t *scr, uint16_t *dst_fb)
+{
+    tab5_scale_rgb565(scr, lcdpal, dst_fb);
+}
+
+static bool tab5_lcd_scale_ppa(const uint8_t *scr, uint16_t *dst_fb)
+{
+    if (!ppa_scale_enabled) {
+        return false;
+    }
+
+    for (size_t pixel = 0, word = 0; pixel < DOOM_W * DOOM_H; pixel += 2, word++) {
+        uint32_t color0 = lcdpal[scr[pixel]];
+        uint32_t color1 = lcdpal[scr[pixel + 1]];
+        native_fb[word] = color0 | (color1 << 16);
+    }
+
+    const ppa_srm_oper_config_t config = {
+        .in = {
+            .buffer = native_fb,
+            .pic_w = DOOM_W,
+            .pic_h = DOOM_H,
+            .block_w = DOOM_W,
+            .block_h = DOOM_H,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer = dst_fb,
+            .buffer_size = TAB5_SCALED_FB_SIZE,
+            .pic_w = TAB5_OUT_W,
+            .pic_h = TAB5_OUT_H,
+            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_90,
+        .scale_x = TAB5_SCALE,
+        .scale_y = TAB5_SCALE,
+        .alpha_update_mode = PPA_ALPHA_NO_CHANGE,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    esp_err_t err = ppa_do_scale_rotate_mirror(scale_ppa, &config);
+
+    if (err != ESP_OK) {
+        ppa_scale_enabled = false;
+        ppa_failures++;
+        ESP_LOGW(TAG, "PPA scale failed (%s); using CPU fallback", esp_err_to_name(err));
+        esp_err_t unregister_err = ppa_unregister_client(scale_ppa);
+        if (unregister_err != ESP_OK) {
+            ESP_LOGW(TAG, "PPA client cleanup failed (%s)",
+                     esp_err_to_name(unregister_err));
+        }
+        scale_ppa = NULL;
+        heap_caps_free(native_fb);
+        native_fb = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void tab5_lcd_schedule_next_frame(TickType_t now)
+{
+    const TickType_t interval = pdMS_TO_TICKS(TAB5_FRAME_INTERVAL_MS);
+
+    if (!frame_deadline_valid) {
+        next_frame_tick = now + interval;
+        frame_deadline_valid = true;
+        return;
+    }
+
+    /*
+     * Advance from the previous deadline instead of from "now". Doom presents
+     * on a 35 Hz cadence, so resetting from now would quantize a 20 FPS target
+     * down to 17.5 FPS (one frame every two game tics).
+     */
+    next_frame_tick = tab5_next_frame_tick(next_frame_tick, now, interval);
+}
+
+void spi_lcd_cycle_diagnostic(void)
+{
+    diagnostic_mode = (diagnostic_mode + 1) % 3;
+    if (diagnostic_mode == 1) {
+        diagnostic_pattern_pending = true;
+    }
+    diagnostic_refresh_pending = true;
+    frame_deadline_valid = false;
+    ESP_LOGI(TAG, "Display diagnostic: %s; T advances mode", diagnostic_names[diagnostic_mode]);
+}
+
+bool spi_lcd_frame_due(void)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    if (diagnostic_mode == 2 && !diagnostic_refresh_pending) {
+        tab5_lcd_log_stats(now);
+        return false;
+    }
+
+    if (frame_deadline_valid && (int32_t)(now - next_frame_tick) < 0) {
+        skipped_frames++;
+        tab5_lcd_log_stats(now);
+        return false;
+    }
+    return true;
+}
 
 void spi_lcd_wait_finish()
 {
@@ -69,46 +263,78 @@ void spi_lcd_wait_finish()
     }
 }
 
-void spi_lcd_send(uint16_t *scr)
+void spi_lcd_send(const uint8_t *scr)
 {
-    uint8_t *src = (uint8_t *)scr;
+    TickType_t now = xTaskGetTickCount();
 
-    if (!scaled_fb[0] || !scaled_fb[1] || !doom_img) {
+    if (!scaled_fb[0] || !scaled_fb[1] || !scaled_fb[2] || !doom_img) {
+        return;
+    }
+    if (diagnostic_mode == 2 && !diagnostic_refresh_pending) {
         return;
     }
 
-    xSemaphoreTake(frameMutex, portMAX_DELAY);
-    int next_fb_idx = scaled_fb_idx ^ 1;
-    uint16_t *dst_fb = scaled_fb[next_fb_idx];
+    if (frame_deadline_valid && (int32_t)(now - next_frame_tick) < 0) {
+        skipped_frames++;
+        tab5_lcd_log_stats(now);
+        return;
+    }
+    tab5_lcd_schedule_next_frame(now);
 
-    for (int y = 0; y < DOOM_H; y++) {
-        uint16_t *dst0 = dst_fb + (y * TAB5_SCALE) * TAB5_FB_W;
-        for (int x = 0; x < DOOM_W; x++) {
-            uint16_t color = (uint16_t)lcdpal[src[y * DOOM_W + x]];
-            int dx = x * TAB5_SCALE;
-            for (int sx = 0; sx < TAB5_SCALE; sx++) {
-                dst0[dx + sx] = color;
-            }
+    xSemaphoreTake(frameMutex, portMAX_DELAY);
+    int next_fb_idx = diagnostic_mode && !diagnostic_pattern_pending ?
+        scaled_fb_idx : (scaled_fb_idx + 1) % 3;
+    uint16_t *dst_fb = scaled_fb[next_fb_idx];
+    int64_t scale_start_us = esp_timer_get_time();
+
+    if (diagnostic_mode) {
+        if (diagnostic_pattern_pending) {
+            tab5_display_test_pattern(dst_fb);
+            diagnostic_pattern_pending = false;
         }
-        for (int sy = 1; sy < TAB5_SCALE; sy++) {
-            memcpy(dst0 + TAB5_FB_W * sy, dst0, TAB5_FB_W * sizeof(uint16_t));
-        }
+    } else if (!tab5_lcd_scale_ppa(scr, dst_fb)) {
+        tab5_lcd_scale_cpu(scr, dst_fb);
+        cpu_scaled_frames++;
+    }
+    uint32_t scale_time_us = (uint32_t)(esp_timer_get_time() - scale_start_us);
+    processed_frames++;
+    scale_time_total_us += scale_time_us;
+    if (scale_time_us > scale_time_max_us) {
+        scale_time_max_us = scale_time_us;
     }
 
+    int displayed = 0;
     if (bsp_display_lock(0)) {
+        int64_t refresh_start_us = esp_timer_get_time();
         scaled_fb_idx = next_fb_idx;
-        doom_img_dsc.data = (const uint8_t *)scaled_fb[scaled_fb_idx];
+        if (diagnostic_refresh_pending) {
+            lv_label_set_text(diagnostic_label, diagnostic_names[diagnostic_mode]);
+        }
 #if LVGL_VERSION_MAJOR >= 9
-        lv_image_set_src(doom_img, &doom_img_dsc);
+        lv_image_set_src(doom_img, &doom_img_dsc[scaled_fb_idx]);
         lv_obj_invalidate(doom_img);
 #else
-        lv_img_set_src(doom_img, &doom_img_dsc);
+        lv_img_set_src(doom_img, &doom_img_dsc[scaled_fb_idx]);
         lv_obj_invalidate(doom_img);
 #endif
+        lv_refr_now(doom_disp);
+        diagnostic_refresh_pending = false;
+        uint32_t refresh_time_us = (uint32_t)(esp_timer_get_time() - refresh_start_us);
+        refresh_time_total_us += refresh_time_us;
+        if (refresh_time_us > refresh_time_max_us) {
+            refresh_time_max_us = refresh_time_us;
+        }
         bsp_display_unlock();
+        displayed = 1;
     }
 
     xSemaphoreGive(frameMutex);
+    if (displayed) {
+        sent_frames++;
+    } else {
+        skipped_frames++;
+    }
+    tab5_lcd_log_stats(xTaskGetTickCount());
 }
 
 void spi_lcd_init()
@@ -126,8 +352,16 @@ void spi_lcd_init()
 
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+#if CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR
+        /* The LVGL port obtains both full-size buffers from the DPI driver.
+         * It draws into the back buffer and waits for scanout handoff instead
+         * of copying 20-line chunks into the currently visible frame. */
+        .buffer_size = BSP_LCD_H_RES * BSP_LCD_V_RES,
+        .double_buffer = true,
+#else
         .buffer_size = BSP_LCD_H_RES * 20,
         .double_buffer = false,
+#endif
         .flags = {
 #if CONFIG_BSP_LCD_COLOR_FORMAT_RGB888
             .buff_dma = false,
@@ -135,39 +369,93 @@ void spi_lcd_init()
             .buff_dma = true,
 #endif
             .buff_spiram = false,
-            .sw_rotate = true,
+            .sw_rotate = false,
         },
     };
 
     disp = bsp_display_start_with_config(&cfg);
     assert(disp);
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+    doom_disp = disp;
     bsp_display_brightness_set(100);
     bsp_display_backlight_on();
 
-    for (int i = 0; i < 2; i++) {
-        scaled_fb[i] = heap_caps_malloc(TAB5_FB_W * TAB5_FB_H * sizeof(uint16_t),
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    for (int i = 0; i < 3; i++) {
+        scaled_fb[i] = heap_caps_aligned_calloc(TAB5_FB_ALIGNMENT,
+                                               1,
+                                               TAB5_SCALED_FB_SIZE,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
         assert(scaled_fb[i]);
-        memset(scaled_fb[i], 0, TAB5_FB_W * TAB5_FB_H * sizeof(uint16_t));
+        tab5_lcd_init_img_dsc(i, (const uint8_t *)scaled_fb[i]);
     }
     scaled_fb_idx = 0;
-    doom_img_dsc.data = (const uint8_t *)scaled_fb[scaled_fb_idx];
+
+#if CONFIG_HW_TAB5_PPA_ENA
+    native_fb = heap_caps_aligned_calloc(TAB5_FB_ALIGNMENT,
+                                         1,
+                                         TAB5_NATIVE_FB_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (native_fb) {
+        const ppa_client_config_t ppa_config = {
+            .oper_type = PPA_OPERATION_SRM,
+            .max_pending_trans_num = 1,
+            /* LCD scanout shares PSRAM with PPA. Shorter bursts leave time
+             * for scanout instead of maximizing PPA's peak bandwidth. */
+            .data_burst_length = PPA_DATA_BURST_LENGTH_32,
+        };
+        esp_err_t err = ppa_register_client(&ppa_config, &scale_ppa);
+        if (err == ESP_OK) {
+            ppa_scale_enabled = true;
+        } else {
+            ESP_LOGW(TAG, "PPA client registration failed (%s); using CPU scaler",
+                     esp_err_to_name(err));
+            heap_caps_free(native_fb);
+            native_fb = NULL;
+        }
+    } else {
+        ESP_LOGW(TAG, "PPA input buffer allocation failed; using CPU scaler");
+    }
+#else
+    ESP_LOGI(TAG, "PPA disabled by configuration; using CPU scaler");
+#endif
 
     if (bsp_display_lock(0)) {
         lv_obj_t *screen = lv_screen_active();
+        lv_obj_set_style_bg_color(screen, lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 #if LVGL_VERSION_MAJOR >= 9
         doom_img = lv_image_create(screen);
-        lv_image_set_src(doom_img, &doom_img_dsc);
+        lv_image_set_src(doom_img, &doom_img_dsc[scaled_fb_idx]);
 #else
         doom_img = lv_img_create(screen);
-        lv_img_set_src(doom_img, &doom_img_dsc);
+        lv_img_set_src(doom_img, &doom_img_dsc[scaled_fb_idx]);
 #endif
         lv_obj_align(doom_img, LV_ALIGN_CENTER, 0, 0);
+        diagnostic_label = lv_label_create(screen);
+        lv_label_set_text(diagnostic_label, diagnostic_names[0]);
+        lv_obj_set_style_text_color(diagnostic_label, lv_color_white(), LV_PART_MAIN);
+        lv_obj_align(diagnostic_label, LV_ALIGN_BOTTOM_MID, 0, -12);
         bsp_display_unlock();
     }
 
-    ESP_LOGI(TAG, "Tab5 display ready: Doom %dx%d -> %dx%d", DOOM_W, DOOM_H, TAB5_FB_W, TAB5_FB_H);
+    ESP_LOGI(TAG,
+             "Tab5 display ready: Doom %dx%d -> %dx%d (3x + 90deg), draw_buf=%u px, max_fps=%u, scaler=%s",
+             DOOM_W,
+             DOOM_H,
+             TAB5_OUT_W,
+             TAB5_OUT_H,
+             (unsigned)cfg.buffer_size,
+             (unsigned)(1000 / TAB5_FRAME_INTERVAL_MS),
+             ppa_scale_enabled ? "PPA" : "CPU");
+    ESP_LOGI(TAG, "Display bandwidth config: PSRAM=%uMHz L2=%uKB PPA_burst=%uB",
+             (unsigned)CONFIG_SPIRAM_SPEED,
+             (unsigned)(CONFIG_CACHE_L2_CACHE_SIZE / 1024),
+             ppa_scale_enabled ? 32u : 0u);
+#if CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR
+    ESP_LOGI(TAG, "Presentation: LCD buffers=%u, frame-boundary handoff enabled",
+             (unsigned)CONFIG_BSP_LCD_DPI_BUFFER_NUMS);
+#else
+    ESP_LOGI(TAG, "Presentation: partial updates to LCD scan buffer");
+#endif
 }
 
 #else
@@ -419,7 +707,12 @@ SemaphoreHandle_t dispDoneSem = NULL;
 #define NO_SIM_TRANS 5 //Amount of SPI transfers to queue in parallel
 #define MEM_PER_TRANS 1024*3 //in 16-bit words
 
-extern int16_t lcdpal[256];
+extern uint16_t lcdpal[256];
+
+bool spi_lcd_frame_due(void)
+{
+    return true;
+}
 
 void IRAM_ATTR displayTask(void *arg) {
 	int x, i;
@@ -530,12 +823,12 @@ void spi_lcd_wait_finish() {
 #endif
 }
 
-void spi_lcd_send(uint16_t *scr) {
+void spi_lcd_send(const uint8_t *scr) {
 #ifdef DOUBLE_BUFFER
 	memcpy(currFbPtr, scr, 320*240);
 	//Theoretically, also should double-buffer the lcdpal array... ahwell.
 #else
-	currFbPtr=scr;
+	currFbPtr=(uint16_t *)scr;
 #endif
 	xSemaphoreGive(dispSem);
 }

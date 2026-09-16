@@ -15,6 +15,7 @@ idf_component_register(
 
 if(CONFIG_HW_M5STACK_TAB5)
     idf_component_optional_requires(PUBLIC m5stack_tab5)
+    idf_component_optional_requires(PRIVATE esp_driver_ppa esp_timer)
 endif()
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

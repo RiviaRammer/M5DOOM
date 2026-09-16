@@ -89,7 +89,9 @@ menu "Board Support Package (ESP32-P4)"
             depends on BSP_LCD_DPI_BUFFER_NUMS > 1
             default "n"
             help
-                Avoid tearing effect through LVGL buffer mode and double frame buffers of RGB LCD. This feature is only available for RGB LCD.
+                Avoid tearing through LVGL buffer mode and two panel-owned
+                frame buffers. Supported for RGB and MIPI-DSI displays by the
+                LVGL port. A completed frame is handed off at a frame boundary.
 
         choice BSP_DISPLAY_LVGL_MODE
             depends on BSP_DISPLAY_LVGL_AVOID_TEAR

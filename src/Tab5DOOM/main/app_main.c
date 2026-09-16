@@ -39,7 +39,10 @@ void app_main()
 	const esp_partition_t* part;
 
 	part=esp_partition_find_first(66, 6, NULL);
-	if (part==0) printf("Couldn't find wad part!\n");
+	if (part==0) {
+		printf("Couldn't find wad part!\n");
+		return;
+	}
 
 	spi_lcd_init();
 	jsInit();

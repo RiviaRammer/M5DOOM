@@ -260,13 +260,9 @@ void bsp_io_expander_pi4ioe_init(i2c_master_bus_handle_t bus_handle)
     i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
     write_buf[0] = PI4IO_REG_CHIP_RESET;
     i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS);
-    write_buf[0] = PI4IO_REG_IO_DIR;
-    write_buf[1] = 0b01111111;
-    i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS);  // 0: input 1: output
-    write_buf[0] = PI4IO_REG_OUT_H_IM;
-    write_buf[1] = 0b00000000;
-    i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2,
-                        I2C_MASTER_TIMEOUT_MS);  // 使用到的引脚关闭 High-Impedance
+    /* Match M5Stack's LCD reset fix: P4 must never drive 3.3V high into
+     * LCD_RST. Keep its output latch low and release it as a pulled-up input.
+     * Configure pulls/latch before enabling any output after chip reset. */
     write_buf[0] = PI4IO_REG_PULL_SEL;
     write_buf[1] = 0b01111111;
     i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2,
@@ -276,10 +272,21 @@ void bsp_io_expander_pi4ioe_init(i2c_master_bus_handle_t bus_handle)
 
     i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2,
                         I2C_MASTER_TIMEOUT_MS);  // P7 中断使能 0 enable, 1 disable
-    /* Output Port Register P1(SPK_EN), P2(EXT5V_EN), P4(LCD_RST), P5(TP_RST), P6(CAM)RST 输出高电平 */
+    /* Other outputs retain their original levels; LCD_RST(P4) stays low. */
     write_buf[0] = PI4IO_REG_OUT_SET;
-    write_buf[1] = 0b01110110;
-    i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
+    write_buf[1] = 0b01100110;
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+    write_buf[0] = PI4IO_REG_OUT_H_IM;
+    write_buf[1] = 0b00000000;
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+    write_buf[0] = PI4IO_REG_IO_DIR;
+    write_buf[1] = 0b01111111;  // P4 output-low: assert reset
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(10));
+    write_buf[0] = PI4IO_REG_IO_DIR;
+    write_buf[1] = 0b01101111;  // P4 input-pull-up: release reset
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     /* */
     i2c_device_config_t dev_cfg2 = {
@@ -514,22 +521,48 @@ void bsp_reset_tp()
     uint8_t write_buf[2] = {0};
     uint8_t read_buf[1]  = {0};
 
+    /* LCD_RST is not a normal push-pull output: assert by driving low,
+     * release by changing direction to input, never by setting its latch. */
     write_buf[0] = PI4IO_REG_OUT_SET;
-    i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS);
-
-    write_buf[0] = PI4IO_REG_OUT_SET;
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS));
     write_buf[1] = read_buf[0];
     clrbit(write_buf[1], 4);
     clrbit(write_buf[1], 5);
-    i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
 
-    write_buf[0] = PI4IO_REG_OUT_SET;
+    write_buf[0] = PI4IO_REG_IO_DIR;
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS));
     write_buf[1] = read_buf[0];
     setbit(write_buf[1], 4);
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    write_buf[0] = PI4IO_REG_OUT_SET;
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS));
+    write_buf[1] = read_buf[0];
+    clrbit(write_buf[1], 4);
     setbit(write_buf[1], 5);
-    i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+
+    write_buf[0] = PI4IO_REG_IO_DIR;
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS));
+    write_buf[1] = read_buf[0];
+    clrbit(write_buf[1], 4);
+    ESP_ERROR_CHECK(i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Verify the expander's actual configuration, not only the write values. */
+    const uint8_t regs[] = {PI4IO_REG_IO_DIR, PI4IO_REG_OUT_SET, PI4IO_REG_PULL_EN, PI4IO_REG_PULL_SEL};
+    uint8_t values[4];
+    for (unsigned i = 0; i < sizeof(regs); i++) {
+        ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, &regs[i], 1,
+                                                   &values[i], 1, I2C_MASTER_TIMEOUT_MS));
+    }
+    const uint8_t lcd_rst = 1u << 4;
+    ESP_ERROR_CHECK(((values[0] & lcd_rst) == 0 && (values[1] & lcd_rst) == 0 &&
+                     (values[2] & lcd_rst) && (values[3] & lcd_rst)) ? ESP_OK : ESP_ERR_INVALID_STATE);
+    ESP_LOGI(TAG, "LCD_RST released as input-pull-up: dir=%02x out=%02x pull_en=%02x pull_sel=%02x",
+             values[0], values[1], values[2], values[3]);
 }
 
 //==================================================================================
@@ -1205,7 +1238,7 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t* config, bsp_l
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = 60,  // 720*1280 RGB24 60Hz RGB24 // 80,
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB565,
-        .num_fbs            = 1,
+        .num_fbs            = CONFIG_BSP_LCD_DPI_BUFFER_NUMS,
         .video_timing =
             {
                 .h_size            = BSP_LCD_H_RES,
@@ -1367,7 +1400,8 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
         .bus_id             = 0,
         .num_data_lanes     = 2,  // ST7123/ST7121 uses 2 data lanes
         .phy_clk_src        = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-        .lane_bit_rate_mbps = 965,  // ST7123/ST7121 lane bitrate
+        // M5GFX/ESPP ST7121 profile; preserve this BSP's ST7123 setting.
+        .lane_bit_rate_mbps = is_st7121 ? 900 : 965,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus), TAG, "New DSI bus init failed");
 
@@ -1384,9 +1418,10 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel    = 0,
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 60,  // Lower clock reduces PSRAM scan underruns on ESP32-P4
+        // ST7121 timing validated by esp-bsp PR #804; leave ST7123 unchanged.
+        .dpi_clock_freq_mhz = is_st7121 ? 70 : 60,
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB565,
-        .num_fbs            = 1,
+        .num_fbs            = CONFIG_BSP_LCD_DPI_BUFFER_NUMS,
         .video_timing =
             {
                 .h_size            = 720,
@@ -1403,6 +1438,9 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
                 .use_dma2d = true,
             },
     };
+
+    ESP_LOGI(TAG, "ST712x timing: requested DPI=%uMHz, DSI lane=%uMbps",
+             (unsigned)dpi_config.dpi_clock_freq_mhz, (unsigned)bus_config.lane_bit_rate_mbps);
 
     st7123_vendor_config_t vendor_config = {
         .init_cmds = is_st7121 ? NULL : st7123_vendor_specific_init_default,

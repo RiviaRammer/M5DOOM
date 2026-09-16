@@ -44,8 +44,10 @@ byte filter_roundedRowMap[4*16];
 void R_FilterInit(void) {
   int i,j,s,t;
 
-	
-	filter_roundedUVMap=malloc(FILTER_UVDIM*FILTER_UVDIM);
+  if (filter_roundedUVMap)
+    return;
+
+  filter_roundedUVMap=malloc(FILTER_UVDIM*FILTER_UVDIM);
 
   // scale2x takes the following source:
   // A B C

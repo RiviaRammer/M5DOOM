@@ -250,23 +250,14 @@ static void R_FLUSHQUAD_FUNCNAME(void)
    }
 #else
   #if (R_DRAWCOLUMN_PIPELINE_BITS == 8)
-   if ((sizeof(int) == 4) && (((int)source % 4) == 0) && (((int)dest % 4) == 0)) {
-      while(--count >= 0)
-      {
-         *(int *)dest = *(int *)source;
-         source += 4 * sizeof(byte);
-         dest += drawvars.PITCH * sizeof(byte);
-      }
-   } else {
-      while(--count >= 0)
-      {
-         dest[0] = source[0];
-         dest[1] = source[1];
-         dest[2] = source[2];
-         dest[3] = source[3];
-         source += 4 * sizeof(byte);
-         dest += drawvars.PITCH * sizeof(byte);
-      }
+   while(--count >= 0)
+   {
+      dest[0] = source[0];
+      dest[1] = source[1];
+      dest[2] = source[2];
+      dest[3] = source[3];
+      source += 4;
+      dest += drawvars.PITCH;
    }
   #else
    while(--count >= 0)

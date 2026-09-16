@@ -35,6 +35,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "tab5_helpers.h"
+#include "spi_lcd.h"
 #else
 #include "psxcontroller.h"
 #include "freertos/FreeRTOS.h"
@@ -71,14 +73,18 @@ enum {
 	TAB5_BTN_ESCAPE      = 1 << 9,
 	TAB5_BTN_PAUSE       = 1 << 10,
 	TAB5_BTN_WEAPON      = 1 << 11,
+	TAB5_BTN_DISPLAY_TEST = 1 << 12,
 };
 
 static const char *TAG = "tab5_input";
 static bool tab5_kb_bus_ready;
 static bool tab5_kb_ready;
 static bool tab5_kb_hid_mode;
+static bool tab5_kb_pending;
+static tab5_key_state_t tab5_kb_keys;
 static TickType_t tab5_kb_next_probe_tick;
 static TickType_t tab5_kb_next_poll_tick;
+static TickType_t tab5_kb_next_safety_poll_tick;
 static TickType_t tab5_kb_next_error_log_tick;
 
 #define TAB5_KEYBOARD_ADDR      0x6d
@@ -100,6 +106,8 @@ static void tab5KeyboardDeinit(void)
 {
 	tab5_kb_ready = false;
 	tab5_kb_hid_mode = false;
+	tab5_kb_pending = false;
+	tab5_kb_keys = (tab5_key_state_t){0};
 	tab5_kb_addr = TAB5_KEYBOARD_ADDR;
 }
 
@@ -347,6 +355,9 @@ static int tab5KeyboardHidToMask(uint8_t modifier, uint8_t keycode)
 	case 0x13: /* P */
 		mask |= TAB5_BTN_PAUSE;
 		break;
+	case 0x17: /* T: display diagnostic, not sent to Doom */
+		mask |= TAB5_BTN_DISPLAY_TEST;
+		break;
 	case 0x27: /* 0 */
 		mask |= TAB5_BTN_WEAPON;
 		break;
@@ -387,7 +398,11 @@ static void tab5KeyboardInit(void)
 	};
 	esp_err_t err;
 
-	(void)gpio_config(&int_cfg);
+	err = gpio_config(&int_cfg);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "Tab5 Keyboard interrupt GPIO init failed: %s", esp_err_to_name(err));
+		return;
+	}
 	bsp_set_ext_5v_en(true);
 	vTaskDelay(pdMS_TO_TICKS(20));
 
@@ -432,9 +447,14 @@ static void tab5KeyboardInit(void)
 		tab5KeyboardDeinit();
 		return;
 	}
-	(void)tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_INT_STAT, 0);
-	(void)tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_EVENT_NUM, 0);
-	(void)tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_INT_CFG, 0x01);
+	if (tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_INT_STAT, 0) != ESP_OK ||
+	    tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_EVENT_NUM, 0) != ESP_OK ||
+	    tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_INT_CFG, 0x01) != ESP_OK) {
+		tab5KeyboardDeinit();
+		return;
+	}
+	tab5_kb_keys = (tab5_key_state_t){0};
+	tab5_kb_pending = true;
 	tab5_kb_hid_mode = false;
 	tab5_kb_ready = true;
 	ESP_LOGI(TAG, "Tab5 Keyboard ready in Normal mode");
@@ -448,6 +468,7 @@ static int tab5ReadKeyboardMask(void)
 	uint8_t raw_event = 0xff;
 
 	if (!tab5_kb_ready) {
+		keyboard_mask = 0;
 		TickType_t now = xTaskGetTickCount();
 		if (now >= tab5_kb_next_probe_tick) {
 			tab5_kb_next_probe_tick = now + pdMS_TO_TICKS(3000);
@@ -457,38 +478,53 @@ static int tab5ReadKeyboardMask(void)
 	}
 
 	TickType_t now = xTaskGetTickCount();
-	if (now < tab5_kb_next_poll_tick) {
+	if ((int32_t)(now - tab5_kb_next_poll_tick) < 0) {
 		return keyboard_mask;
 	}
 	tab5_kb_next_poll_tick = now + pdMS_TO_TICKS(20);
+
+	/* Continue a partial drain even after INT clears; periodically check for a
+	 * missed interrupt without paying the software-I2C cost every game tick. */
+	if (!tab5_kb_pending && gpio_get_level(TAB5_KEYBOARD_INT) != 0 &&
+	    (int32_t)(now - tab5_kb_next_safety_poll_tick) < 0) {
+		return keyboard_mask;
+	}
+	tab5_kb_next_safety_poll_tick = now + pdMS_TO_TICKS(500);
+	tab5_kb_pending = true;
+	/* Acknowledge before taking the queue snapshot, so an event arriving while
+	 * we drain cannot have its interrupt cleared at the end of this poll. */
+	if (tab5KeyboardWriteReg(TAB5_KEYBOARD_REG_INT_STAT, 0) != ESP_OK) {
+		tab5KeyboardLogErrorLimited("Tab5 Keyboard interrupt clear failed");
+		return keyboard_mask;
+	}
 
 	if (tab5KeyboardReadReg(TAB5_KEYBOARD_REG_EVENT_NUM, &event_num, 1) != ESP_OK) {
 		tab5KeyboardLogErrorLimited("Tab5 Keyboard EVENT_NUM read failed");
 		return keyboard_mask;
 	}
 	if (event_num) {
-		ESP_LOGI(TAG, "Tab5 Keyboard event_num=%u", event_num);
+		ESP_LOGD(TAG, "Tab5 Keyboard event_num=%u", event_num);
 	}
-	while (event_num--) {
+	if (event_num == 0) tab5_kb_pending = false;
+	/* Bound software-I2C work so a large event backlog cannot stall a frame. */
+	const unsigned event_budget = 4;
+	for (unsigned event_index = 0; event_index < event_num && event_index < event_budget; event_index++) {
 		if (!tab5_kb_hid_mode) {
 			if (tab5KeyboardReadReg(TAB5_KEYBOARD_REG_KEY_EVENT, &raw_event, 1) != ESP_OK) {
 				tab5KeyboardLogErrorLimited("Tab5 Keyboard normal event read failed");
 				break;
 			}
 			if (raw_event == 0xff) {
-				ESP_LOGI(TAG, "Tab5 Keyboard normal queue empty marker");
+				ESP_LOGD(TAG, "Tab5 Keyboard normal queue empty marker");
+				tab5_kb_pending = false;
 				break;
 			}
 			bool pressed = (raw_event & 0x80) != 0;
 			uint8_t row = (raw_event >> 4) & 0x07;
 			uint8_t col = raw_event & 0x0f;
 			int key_mask = tab5KeyboardMatrixToMask(row, col);
-			if (pressed) {
-				keyboard_mask |= key_mask;
-			} else {
-				keyboard_mask &= ~key_mask;
-			}
-			ESP_LOGI(TAG, "Tab5 Keyboard NORMAL raw=0x%02x pressed=%u row=%u col=%u key_mask=0x%03x mask=0x%03x",
+			keyboard_mask = tab5_key_update(&tab5_kb_keys, row, col, pressed, (uint16_t)key_mask);
+			ESP_LOGD(TAG, "Tab5 Keyboard NORMAL raw=0x%02x pressed=%u row=%u col=%u key_mask=0x%03x mask=0x%03x",
 			         raw_event, pressed, row, col, key_mask, keyboard_mask);
 			continue;
 		}
@@ -497,14 +533,14 @@ static int tab5ReadKeyboardMask(void)
 			break;
 		}
 		if (event[0] == 0xff && event[1] == 0xff) {
-			ESP_LOGI(TAG, "Tab5 Keyboard HID queue empty marker");
+			ESP_LOGD(TAG, "Tab5 Keyboard HID queue empty marker");
+			tab5_kb_pending = false;
 			break;
 		}
 		keyboard_mask = tab5KeyboardHidToMask(event[0], event[1]);
-		ESP_LOGI(TAG, "Tab5 Keyboard HID mod=0x%02x key=0x%02x mask=0x%03x",
+		ESP_LOGD(TAG, "Tab5 Keyboard HID mod=0x%02x key=0x%02x mask=0x%03x",
 		         event[0], event[1], keyboard_mask);
 	}
-
 	return keyboard_mask;
 }
 
@@ -519,21 +555,34 @@ static int tab5ReadTouchMask(void)
 	if (!indev) {
 		return 0;
 	}
+	if (!bsp_display_lock(0)) {
+		return 0;
+	}
 
 #if LVGL_VERSION_MAJOR >= 9
 	if (lv_indev_get_state(indev) != LV_INDEV_STATE_PRESSED) {
+		bsp_display_unlock();
 		return 0;
 	}
-	w = lv_display_get_horizontal_resolution(lv_display_get_default());
-	h = lv_display_get_vertical_resolution(lv_display_get_default());
 #else
 	if (lv_indev_get_state(indev) != LV_INDEV_STATE_PR) {
+		bsp_display_unlock();
 		return 0;
 	}
-	w = lv_disp_get_hor_res(NULL);
-	h = lv_disp_get_ver_res(NULL);
 #endif
 	lv_indev_get_point(indev, &point);
+	bsp_display_unlock();
+
+	/*
+	 * The image is rotated 90 degrees directly by PPA while LVGL stays in
+	 * panel-native portrait coordinates. Convert touch back to the equivalent
+	 * 1280x720 landscape coordinates used by the control layout.
+	 */
+	int raw_x = point.x;
+	point.x = BSP_LCD_V_RES - point.y - 1;
+	point.y = raw_x;
+	w = BSP_LCD_V_RES;
+	h = BSP_LCD_H_RES;
 
 	if (point.y < h / 5) {
 		if (point.x < w / 4) {
@@ -623,6 +672,9 @@ void gamepadPoll(void)
 #if CONFIG_HW_M5STACK_TAB5
 		0;
 	int newJoyVal=tab5ReadTouchMask() | tab5ReadKeyboardMask();
+	if ((newJoyVal & ~oldPollJsVal) & TAB5_BTN_DISPLAY_TEST) {
+		spi_lcd_cycle_diagnostic();
+	}
 #else
 		0xffff;
 	int newJoyVal=joyVal;

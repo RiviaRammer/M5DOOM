@@ -457,7 +457,12 @@ void (Z_Free)(void *p
 #endif
              )
 {
-  memblock_t *block = (memblock_t *)((char *) p - HEADER_SIZE);
+  memblock_t *block;
+
+  if (!p)
+    return;
+
+  block = (memblock_t *)((char *) p - HEADER_SIZE);
 
 #ifdef INSTRUMENTED
 #ifdef CHECKHEAP
@@ -467,10 +472,6 @@ void (Z_Free)(void *p
   line_history[free_history][history_index[free_history]++] = line;
   history_index[free_history] &= ZONE_HISTORY-1;
 #endif
-
-  if (!p)
-    return;
-
 
 #ifdef ZONEIDCHECK
   if (block->id != ZONEID)
@@ -560,11 +561,13 @@ void (Z_ChangeTag)(void *ptr, int tag
 #endif
        )
 {
-  memblock_t *block = (memblock_t *)((char *) ptr - HEADER_SIZE);
+  memblock_t *block;
 
   // proff - added sanity check, this can happen when an empty lump is locked
   if (!ptr)
     return;
+
+  block = (memblock_t *)((char *) ptr - HEADER_SIZE);
 
   // proff - do nothing if tag doesn't differ
   if (tag == block->tag)

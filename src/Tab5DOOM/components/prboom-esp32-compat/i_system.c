@@ -87,13 +87,18 @@ int realtime=0;
 
 void I_uSleep(unsigned long usecs)
 {
-	vTaskDelay(usecs/1000);
+	if (usecs == 0) {
+		taskYIELD();
+		return;
+	}
+
+	TickType_t ticks = (TickType_t)(((uint64_t)usecs * configTICK_RATE_HZ + 999999) / 1000000);
+	vTaskDelay(ticks);
 }
 
 static unsigned long getMsTicks() {
   struct timeval tv;
   struct timezone tz;
-  unsigned long thistimereply;
 
   gettimeofday(&tv, &tz);
 
@@ -106,13 +111,18 @@ int I_GetTime_RealTime (void)
 {
   struct timeval tv;
   struct timezone tz;
-  unsigned long thistimereply;
+  int64_t now_us;
+  int64_t scaled_time;
+  int64_t remaining_us;
 
   gettimeofday(&tv, &tz);
 
-  thistimereply = (tv.tv_sec * TICRATE + (tv.tv_usec * TICRATE) / 1000000);
+  now_us = (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+  scaled_time = now_us * TICRATE;
+  remaining_us = (1000000 - scaled_time % 1000000 + TICRATE - 1) / TICRATE;
+  ms_to_next_tick = (int)((remaining_us + 999) / 1000);
 
-  return thistimereply;
+  return (int)(scaled_time / 1000000);
 
 }
 
@@ -166,23 +176,48 @@ const char* I_SigString(char* buf, size_t sz, int signum)
   return buf;
 }
 
-extern unsigned char *doom1waddata;
-
 typedef struct {
 	const esp_partition_t* part;
+	const void *mmap_base;
+	spi_flash_mmap_handle_t mmap_handle;
 	int offset;
 	int size;
 } FileDesc;
 
 static FileDesc fds[32];
 
+static int I_ValidFd(int fd)
+{
+	return fd >= 0 && fd < (int)(sizeof(fds) / sizeof(fds[0])) &&
+	       fds[fd].part != NULL;
+}
+
 int I_Open(const char *wad, int flags) {
 	int x=3;
-	while (fds[x].part!=NULL) x++;
+	(void)flags;
+	while (x < (int)(sizeof(fds) / sizeof(fds[0])) && fds[x].part!=NULL) x++;
+	if (x == (int)(sizeof(fds) / sizeof(fds[0]))) {
+		lprintf(LO_ERROR, "I_Open: file descriptor table is full\n");
+		return -1;
+	}
 	if (strcmp(wad, "DOOM1.WAD")==0) {
 		fds[x].part=esp_partition_find_first(66, 6, NULL);
+		if (!fds[x].part) {
+			lprintf(LO_ERROR, "I_Open: WAD partition not found\n");
+			return -1;
+		}
 		fds[x].offset=0;
 		fds[x].size=fds[x].part->size;
+		esp_err_t err = esp_partition_mmap(fds[x].part, 0, fds[x].size,
+		                                  SPI_FLASH_MMAP_DATA, &fds[x].mmap_base,
+		                                  &fds[x].mmap_handle);
+		if (err == ESP_OK) {
+			lprintf(LO_INFO, "I_Open: mapped %d-byte WAD partition, %u data MMU pages free\n",
+			        fds[x].size, (unsigned)spi_flash_mmap_get_free_pages(SPI_FLASH_MMAP_DATA));
+		} else {
+			fds[x].mmap_base = NULL;
+			lprintf(LO_WARN, "I_Open: whole-WAD mmap failed (%x), using lump cache\n", err);
+		}
 	} else {
 		lprintf(LO_INFO, "I_Open: open %s failed\n", wad);
 		return -1;
@@ -191,29 +226,59 @@ int I_Open(const char *wad, int flags) {
 }
 
 int I_Lseek(int ifd, off_t offset, int whence) {
-	if (whence==SEEK_SET) {
-		fds[ifd].offset=offset;
-	} else if (whence==SEEK_CUR) {
-		fds[ifd].offset+=offset;
-	} else if (whence==SEEK_END) {
-		lprintf(LO_INFO, "I_Lseek: SEEK_END unimplemented\n");
+	int64_t new_offset;
+
+	if (!I_ValidFd(ifd)) {
+		lprintf(LO_ERROR, "I_Lseek: invalid file descriptor %d\n", ifd);
+		return -1;
 	}
+
+	if (whence==SEEK_SET) {
+		new_offset=offset;
+	} else if (whence==SEEK_CUR) {
+		new_offset=(int64_t)fds[ifd].offset+offset;
+	} else if (whence==SEEK_END) {
+		new_offset=(int64_t)fds[ifd].size+offset;
+	} else {
+		lprintf(LO_ERROR, "I_Lseek: invalid whence %d\n", whence);
+		return -1;
+	}
+
+	if (new_offset < 0 || new_offset > fds[ifd].size) {
+		lprintf(LO_ERROR, "I_Lseek: offset %d is outside file (size %d)\n",
+		        (int)new_offset, fds[ifd].size);
+		return -1;
+	}
+
+	fds[ifd].offset=(int)new_offset;
 	return fds[ifd].offset;
 }
 
 int I_Filelength(int ifd)
 {
+	if (!I_ValidFd(ifd)) {
+		lprintf(LO_ERROR, "I_Filelength: invalid file descriptor %d\n", ifd);
+		return -1;
+	}
 	return fds[ifd].size;
 }
 
 void I_Close(int fd) {
-	fds[fd].part=NULL;
+	if (!I_ValidFd(fd)) {
+		lprintf(LO_WARN, "I_Close: invalid file descriptor %d\n", fd);
+		return;
+	}
+	if (fds[fd].mmap_base) {
+		spi_flash_munmap(fds[fd].mmap_handle);
+	}
+	memset(&fds[fd], 0, sizeof(fds[fd]));
 }
 
 
 typedef struct {
 	spi_flash_mmap_handle_t handle;
 	void *addr;
+	const esp_partition_t *part;
 	int offset;
 	size_t len;
 	int used;
@@ -232,14 +297,14 @@ static int getFreeHandle() {
 	}
 	if (n==0) {
 		lprintf(LO_ERROR, "I_Mmap: More mmaps than NO_MMAP_HANDLES!");
-		exit(0);
+		return -1;
 	}
 	
 	if (mmapHandle[nextHandle].addr) {
 		spi_flash_munmap(mmapHandle[nextHandle].handle);
-		mmapHandle[nextHandle].addr=NULL;
 //		printf("mmap: freeing handle %d\n", nextHandle);
 	}
+	memset(&mmapHandle[nextHandle], 0, sizeof(mmapHandle[nextHandle]));
 	int r=nextHandle;
 	nextHandle++;
 	if (nextHandle==NO_MMAP_HANDLES) nextHandle=0;
@@ -252,8 +317,7 @@ static void freeUnusedMmaps() {
 		//Check if handle is not in use but is mapped.
 		if (mmapHandle[i].used==0 && mmapHandle[i].addr!=NULL) {
 			spi_flash_munmap(mmapHandle[i].handle);
-			mmapHandle[i].addr=NULL;
-			printf("Freeing handle %d\n", i);
+			memset(&mmapHandle[i], 0, sizeof(mmapHandle[i]));
 		}
 	}
 }
@@ -263,14 +327,31 @@ void *I_Mmap(void *addr, size_t length, int prot, int flags, int ifd, off_t offs
 	esp_err_t err;
 	void *retaddr=NULL;
 
+	if (!I_ValidFd(ifd) || offset < 0 || (size_t)offset > (size_t)fds[ifd].size ||
+	    length > (size_t)fds[ifd].size - (size_t)offset) {
+		lprintf(LO_ERROR, "I_Mmap: invalid fd/range fd=%d offset=%d len=%d\n",
+		        ifd, (int)offset, (int)length);
+		return NULL;
+	}
+
+	if (fds[ifd].mmap_base) {
+		return (uint8_t *)fds[ifd].mmap_base + offset;
+	}
+
 	for (i=0; i<NO_MMAP_HANDLES; i++) {
-		if (mmapHandle[i].offset==offset && mmapHandle[i].len==length) {
+		if (mmapHandle[i].addr != NULL &&
+		    mmapHandle[i].part == fds[ifd].part &&
+		    mmapHandle[i].offset == offset &&
+		    mmapHandle[i].len == length) {
 			mmapHandle[i].used++;
 			return mmapHandle[i].addr;
 		}
 	}
 
 	i=getFreeHandle();
+	if (i < 0) {
+		return NULL;
+	}
 
 	//lprintf(LO_INFO, "I_Mmap: mmaping offset %d size %d handle %d\n", (int)offset, (int)length, i);
 	err=esp_partition_mmap(fds[ifd].part, offset, length, SPI_FLASH_MMAP_DATA, (const void**)&retaddr, &mmapHandle[i].handle);
@@ -279,28 +360,50 @@ void *I_Mmap(void *addr, size_t length, int prot, int flags, int ifd, off_t offs
 		freeUnusedMmaps();
 		err=esp_partition_mmap(fds[ifd].part, offset, length, SPI_FLASH_MMAP_DATA, (const void**)&retaddr, &mmapHandle[i].handle);
 	}
-	mmapHandle[i].addr=retaddr;
-	mmapHandle[i].len=length;
-	mmapHandle[i].used=1;
-	mmapHandle[i].offset=offset;
 
 	if (err!=ESP_OK) {
 		lprintf(LO_ERROR, "I_Mmap: Can't mmap: %x (len=%d)!", err, length);
+		memset(&mmapHandle[i], 0, sizeof(mmapHandle[i]));
 		return NULL;
 	}
 
+	mmapHandle[i].addr=retaddr;
+	mmapHandle[i].part=fds[ifd].part;
+	mmapHandle[i].len=length;
+	mmapHandle[i].used=1;
+	mmapHandle[i].offset=offset;
 	return retaddr;
 }
 
 
 int I_Munmap(void *addr, size_t length) {
 	int i;
+	uintptr_t address = (uintptr_t)addr;
+
+	if (!addr) {
+		lprintf(LO_ERROR, "I_Munmap: NULL address\n");
+		return -1;
+	}
+
+	for (i=0; i<(int)(sizeof(fds) / sizeof(fds[0])); i++) {
+		uintptr_t base = (uintptr_t)fds[i].mmap_base;
+		if (base && address >= base &&
+		    address - base <= (uintptr_t)fds[i].size &&
+		    length <= (uintptr_t)fds[i].size - (address - base)) {
+			return 0;
+		}
+	}
+
 	for (i=0; i<NO_MMAP_HANDLES; i++) {
 		if (mmapHandle[i].addr==addr && mmapHandle[i].len==length) break;
 	}
 	if (i==NO_MMAP_HANDLES) {
-		lprintf(LO_ERROR, "I_Mmap: Freeing non-mmapped address/len combo!");
-		exit(0);
+		lprintf(LO_ERROR, "I_Munmap: freeing non-mmapped address/len combo\n");
+		return -1;
+	}
+	if (mmapHandle[i].used <= 0) {
+		lprintf(LO_ERROR, "I_Munmap: handle %d is already unused\n", i);
+		return -1;
 	}
 //	lprintf(LO_INFO, "I_Mmap: freeing handle %d\n", i);
 	mmapHandle[i].used--;
@@ -309,9 +412,25 @@ int I_Munmap(void *addr, size_t length) {
 
 void I_Read(int ifd, void* vbuf, size_t sz)
 {
-	uint8_t *d=I_Mmap(NULL, sz, 0, 0, ifd, fds[ifd].offset);
+	uint8_t *d;
+
+	if (!I_ValidFd(ifd) || (!vbuf && sz != 0)) {
+		I_Error("I_Read: invalid file descriptor or buffer");
+		return;
+	}
+	if (sz == 0) {
+		return;
+	}
+
+	d=I_Mmap(NULL, sz, 0, 0, ifd, fds[ifd].offset);
+	if (!d) {
+		I_Error("I_Read: failed at offset %d for %u bytes",
+		        fds[ifd].offset, (unsigned)sz);
+		return;
+	}
 	memcpy(vbuf, d, sz);
 	I_Munmap(d, sz);
+	fds[ifd].offset+=(int)sz;
 }
 
 const char *I_DoomExeDir(void)
@@ -323,9 +442,8 @@ const char *I_DoomExeDir(void)
 
 char* I_FindFile(const char* wfname, const char* ext)
 {
-  char *p;
-  p = malloc(strlen(wfname)+4);
-  sprintf(p, "%s.%s", wfname, ext);
+  (void)wfname;
+  (void)ext;
   return NULL;
 }
 
@@ -339,5 +457,3 @@ int access(const char *path, int atype) {
     return 1;
 }
 #endif
-
-
