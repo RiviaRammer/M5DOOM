@@ -1518,8 +1518,12 @@ void G_DoLoadGame(void)
   gameaction = ga_nothing;
 
   length = M_ReadFile(name, &savebuffer);
-  if (length<=0)
-    I_Error("Couldn't read file %s: %s", name, "(Unknown Error)");
+  if (length < SAVESTRINGSIZE + VERSIONSIZE + 1 || savebuffer[length - 1] != 0xe6) {
+    if (savebuffer) Z_Free(savebuffer);
+    savebuffer = save_p = NULL;
+    doom_printf("Game load failed!");
+    return;
+  }
   save_p = savebuffer + SAVESTRINGSIZE;
 
   // CPhipps - read the description field, compare with supported ones
@@ -1720,6 +1724,10 @@ static void G_DoSaveGame (boolean menu)
   description = savedescription;
 
   save_p = savebuffer = malloc(savegamesize);
+  if (!savebuffer) {
+    doom_printf("Game save failed: out of memory!");
+    return;
+  }
 
   CheckSaveGame(SAVESTRINGSIZE+VERSIONSIZE+sizeof(uint_64_t));
   memcpy (save_p, description, SAVESTRINGSIZE);

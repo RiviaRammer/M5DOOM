@@ -23,6 +23,7 @@
 #include "i_system.h"
 
 #include "spi_lcd.h"
+#include "tab5_storage.h"
 
 
 extern void jsInit();
@@ -30,8 +31,14 @@ extern void jsInit();
 
 void doomEngineTask(void *pvParameters)
 {
+#ifdef TAB5_SAVE_SELFTEST
+    char const *argv[]={"doom", "-cout", "ICWEFDA",
+                        "-warp", "1", "1", "-skill", "1", NULL};
+    doom_main(8, argv);
+#else
     char const *argv[]={"doom","-cout","ICWEFDA", NULL};
     doom_main(3, argv);
+#endif
 }
 
 void app_main()
@@ -44,6 +51,7 @@ void app_main()
 		return;
 	}
 
+	tab5_storage_init();
 	spi_lcd_init();
 	jsInit();
 	xTaskCreatePinnedToCore(&doomEngineTask, "doomEngine", 22480, NULL, 5, NULL, 0);

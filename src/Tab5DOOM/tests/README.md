@@ -1,5 +1,57 @@
 # Tab5 host regression tests
 
+## Current Flash-save validation
+
+The former T-key static-image diagnostic has been removed from production.
+The display investigations below are historical records. The final 70/900
+ST7121 profile was confirmed flicker-free by the user and is unchanged here.
+
+`tests/test_save_io.ps1` extracts the actual `M_WriteFile`/`M_ReadFile` functions
+and tests creation, overwrite, round-trip binary data, missing/empty files,
+short writes, close failures, failed promotion rollback and short-read cleanup.
+Run with a host GCC, using an absolute output path in a temporary directory:
+
+```powershell
+./tests/test_save_io.ps1 -Compiler gcc -Output "$env:TEMP/tab5_save_io_test.exe"
+```
+
+`test_save_layout.py` checks non-overlapping partitions, the 16 MiB limit,
+unchanged WAD placement, full-flash reset policy and removal of T diagnostics.
+
+For an explicitly destructive hardware regression, build with
+`idf.py -B build -D TAB5_SAVE_SELFTEST=ON build`. It starts E1M1, saves a real
+engine state into slot 8, restarts, loads it and verifies health, armor,
+ammo, position and the menu slot name. It then overwrites and reloads the slot.
+This opt-in test is not part of normal firmware; it consumes slot 8 and leaves
+test data for checking app-flash persistence. It does not simulate physical
+power removal or guarantee filesystem recovery from every power-loss timing.
+
+Always finish with `idf.py -B build -D TAB5_SAVE_SELFTEST=OFF build` and a full
+`flash`. This removes the automatic test and clears test saves. SPIFFS mount
+failure never automatically formats the user's partition. Its flat VFS mount
+is selected with `DOOMSAVEDIR`, avoiding PrBoom's desktop `-save` directory test.
+
+Hardware results on 2026-09-16 (IDF 5.5.1, COM7):
+
+- `build/serial-20260916-145009-346631.log`: engine wrote a 33,946-byte save,
+  rebooted, restored health 73 / armor 19 / ammo 37 and exact player position;
+  the menu read the slot name correctly. Overwrite/load then restored
+  health 51 / armor 29 / ammo 47. Both phases logged PASS; zero LCD underruns.
+- `build/serial-20260916-145137-641494.log`: app-only reflash retained that save
+  and loaded the overwritten state successfully. Both load phases passed.
+- Final normal build: `TAB5_SAVE_SELFTEST=OFF`, application 1,340,800 bytes,
+  no self-test source/define in compile commands and no T-diagnostic/self-test
+  entry-point symbols in the linked ELF. Host save-I/O fault tests, LCD reset
+  mock, helper regressions and eight Python tests passed.
+- Final full flash passed all write hash checks. The 25-second capture
+  `build/serial-20260916-145349-539486.log` reports save filesystem `used=0`,
+  confirming the test saves were cleared; requested DPI=70 / lane=900 is
+  unchanged, no automatic self-test ran, and zero LCD underruns were observed.
+  Normal-game statistics were 7.98–8.78 FPS, not a controlled benchmark.
+
+The initial hardware attempt caught the SPIFFS directory-check mismatch before
+release. The successful logs above are from the corrected implementation.
+
 These tests compile the same dependency-free helpers used by the ESP32-P4
 firmware. They do not require ESP-IDF or a connected Tab5.
 

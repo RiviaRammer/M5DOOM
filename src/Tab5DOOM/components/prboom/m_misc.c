@@ -83,22 +83,39 @@ static inline void I_EndRead(void) {}
 
 boolean M_WriteFile(char const *name, void *source, int length)
 {
+  char temporary[PATH_MAX+1], backup[PATH_MAX+1];
+  struct stat st;
   FILE *fp;
-  return 0;
-  errno = 0;
+  int ok, had_previous;
+  if (!name || length <= 0 || !source ||
+      snprintf(temporary, sizeof(temporary), "%s.tmp", name) >= sizeof(temporary) ||
+      snprintf(backup, sizeof(backup), "%s.bak", name) >= sizeof(backup))
+    return 0;
 
-  if (!(fp = fopen(name, "wb")))       // Try opening file
-    return 0;                          // Could not open file for writing
+  if (!(fp = fopen(temporary, "wb"))) return 0;
+  I_BeginRead();
+  ok = fwrite(source, 1, length, fp) == (size_t)length;
+  if (fflush(fp) != 0) ok = 0;
+  if (fclose(fp) != 0) ok = 0;
+  I_EndRead();
+  if (!ok) { remove(temporary); return 0; }
 
-  I_BeginRead();                       // Disk icon on
-  length = fwrite(source, 1, length, fp) == (size_t)length;   // Write data
-  fclose(fp);
-  I_EndRead();                         // Disk icon off
-
-  if (!length)                         // Remove partially written file
-    remove(name);
-
-  return length;
+  /* SPIFFS rename does not overwrite an existing destination. Keep the old
+   * slot recoverable until the fully written replacement has been promoted. */
+  had_previous = stat(name, &st) == 0;
+  if (!had_previous && errno != ENOENT) { remove(temporary); return 0; }
+  if (had_previous) {
+    if (remove(backup) != 0 && errno != ENOENT) { remove(temporary); return 0; }
+    if (rename(name, backup) != 0) { remove(temporary); return 0; }
+  }
+  if (rename(temporary, name) != 0) {
+    if (had_previous) rename(backup, name);
+    remove(temporary);
+    return 0;
+  }
+  remove(backup);
+  lprintf(LO_INFO, "Saved %s (%d bytes)\n", name, length);
+  return 1;
 }
 
 /*
@@ -110,25 +127,30 @@ boolean M_WriteFile(char const *name, void *source, int length)
 int M_ReadFile(char const *name, byte **buffer)
 {
   FILE *fp;
-
-  lprintf(LO_WARN, "Attempting M_ReadFile %s\n", name);
-  return -1;
+  *buffer = NULL;
   if ((fp = fopen(name, "rb")))
     {
-      size_t length;
+      long length;
 
       I_BeginRead();
-      fseek(fp, 0, SEEK_END);
+      if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); I_EndRead(); return -1; }
       length = ftell(fp);
-      fseek(fp, 0, SEEK_SET);
+      /* Bound allocations on corrupt files; the whole save partition is 4 MiB. */
+      if (length <= 0 || length > 4 * 1024 * 1024 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp); I_EndRead(); return -1;
+      }
       *buffer = Z_Malloc(length, PU_STATIC, 0);
-      if (fread(*buffer, 1, length, fp) == length)
+      if (fread(*buffer, 1, length, fp) == (size_t)length)
         {
           fclose(fp);
           I_EndRead();
+          lprintf(LO_INFO, "Loaded %s (%ld bytes)\n", name, length);
           return length;
         }
       fclose(fp);
+      Z_Free(*buffer);
+      *buffer = NULL;
+      I_EndRead();
     }
 
   /* cph 2002/08/10 - this used to return 0 on error, but that's ambiguous,

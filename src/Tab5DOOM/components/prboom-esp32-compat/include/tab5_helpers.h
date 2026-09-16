@@ -50,26 +50,6 @@ static inline void tab5_scale_rgb565(const uint8_t *src, const uint16_t *palette
     }
 }
 
-/* A deterministic RGB565 test image independent of Doom and its palette. */
-static inline void tab5_display_test_pattern(uint16_t *dst)
-{
-    static const uint16_t bars[8] = {
-        0xffff, 0xffe0, 0x07ff, 0x07e0, 0xf81f, 0xf800, 0x001f, 0x8410
-    };
-    const unsigned width = TAB5_DOOM_HEIGHT * TAB5_DOOM_SCALE;
-    const unsigned height = TAB5_DOOM_WIDTH * TAB5_DOOM_SCALE;
-    for (unsigned y = 0; y < height; y++) {
-        for (unsigned x = 0; x < width; x++) {
-            uint16_t color = y < height / 2 ? bars[x * 8 / width] :
-                (((x / 60) + (y / 60)) % 2 ? 0x4208 : 0xbdf7);
-            if (x < 4 || y < 4 || x >= width - 4 || y >= height - 4) {
-                color = 0xffff;
-            }
-            dst[y * width + x] = color;
-        }
-    }
-}
-
 /* Called only when due; unsigned subtraction also handles tick wraparound. */
 static inline uint32_t tab5_next_frame_tick(uint32_t previous, uint32_t now,
                                             uint32_t interval)

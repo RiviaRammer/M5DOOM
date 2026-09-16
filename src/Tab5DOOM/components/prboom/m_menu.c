@@ -843,14 +843,14 @@ void M_ReadSaveStrings(void)
     /* killough 3/22/98
      * cph - add not-demoplayback parameter */
     G_SaveGameName(name,sizeof(name),i,false);
-    fp=NULL;
-    //fp = fopen(name,"rb");
-    if (!fp) {   // Ty 03/27/98 - externalized:
+    fp = fopen(name,"rb");
+    if (!fp || fread(savegamestrings[i], SAVESTRINGSIZE, 1, fp) != 1) {
+      if (fp) fclose(fp);
       strcpy(&savegamestrings[i][0],s_EMPTYSTRING);
       LoadMenue[i].status = 0;
       continue;
     }
-    fread(&savegamestrings[i], SAVESTRINGSIZE, 1, fp);
+    savegamestrings[i][SAVESTRINGSIZE - 1] = 0;
     fclose(fp);
     LoadMenue[i].status = 1;
   }
@@ -903,7 +903,14 @@ void M_SaveSelect(int choice)
   saveSlot = choice;
   strcpy(saveOldString,savegamestrings[choice]);
   if (!strcmp(savegamestrings[choice],s_EMPTYSTRING)) // Ty 03/27/98 - externalized
+#ifdef ESP_PLATFORM
+    /* Tab5 maps gameplay actions, not a full text keyboard. Enter twice can
+     * now save an empty slot without requiring free-form text entry. */
+    snprintf(savegamestrings[choice], SAVESTRINGSIZE, "E%dM%d SLOT %d",
+             gameepisode, gamemap, choice + 1);
+#else
     savegamestrings[choice][0] = 0;
+#endif
   saveCharIndex = strlen(savegamestrings[choice]);
 }
 

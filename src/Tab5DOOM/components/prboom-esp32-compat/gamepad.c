@@ -36,7 +36,7 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "tab5_helpers.h"
-#include "spi_lcd.h"
+#include "tab5_storage.h"
 #else
 #include "psxcontroller.h"
 #include "freertos/FreeRTOS.h"
@@ -73,7 +73,6 @@ enum {
 	TAB5_BTN_ESCAPE      = 1 << 9,
 	TAB5_BTN_PAUSE       = 1 << 10,
 	TAB5_BTN_WEAPON      = 1 << 11,
-	TAB5_BTN_DISPLAY_TEST = 1 << 12,
 };
 
 static const char *TAG = "tab5_input";
@@ -354,9 +353,6 @@ static int tab5KeyboardHidToMask(uint8_t modifier, uint8_t keycode)
 		break;
 	case 0x13: /* P */
 		mask |= TAB5_BTN_PAUSE;
-		break;
-	case 0x17: /* T: display diagnostic, not sent to Doom */
-		mask |= TAB5_BTN_DISPLAY_TEST;
 		break;
 	case 0x27: /* 0 */
 		mask |= TAB5_BTN_WEAPON;
@@ -668,13 +664,13 @@ static const JsKeyMap keymap[]={
 
 void gamepadPoll(void)
 {
+#ifdef TAB5_SAVE_SELFTEST
+	tab5_save_selftest_poll();
+#endif
 	static int oldPollJsVal=
 #if CONFIG_HW_M5STACK_TAB5
 		0;
 	int newJoyVal=tab5ReadTouchMask() | tab5ReadKeyboardMask();
-	if ((newJoyVal & ~oldPollJsVal) & TAB5_BTN_DISPLAY_TEST) {
-		spi_lcd_cycle_diagnostic();
-	}
 #else
 		0xffff;
 	int newJoyVal=joyVal;

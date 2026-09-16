@@ -80,6 +80,9 @@ DSI lane=900 Mbps, correct LCD_RST readback and zero LCD underruns. Normal-game
 statistics were 7.81–8.64 FPS. The pre-existing unsupported `swap_xy` message
 does not establish a new regression. Visual comparison with 70/965 is pending;
 zero underruns alone is not evidence that residual flicker disappeared.
+The user subsequently confirmed that visible flicker disappeared at 70/900.
+The T-key diagnostic was then removed at the user's request; the experiment
+above remains a historical record, not an available production feature.
 
 If residual flicker persists (already confirmed visible directly at 70/965),
 test a stand-alone no-Doom/no-LVGL scanout pattern before a broad

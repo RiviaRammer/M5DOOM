@@ -30,10 +30,10 @@ class CaptureSummaryTests(unittest.TestCase):
     def test_interleaved_errors(self):
         self.assertEqual(capture.summarize("underrun happensunderrun happens"), (2, []))
 
-    def test_display_diagnostic(self):
+    def test_multiple_statistics(self):
         lines = [
-            "I (6000) tab5_lcd: Display diagnostic: TEST 2: STATIC HOLD; T advances mode",
-            "I (11000) tab5_lcd: frames sent=0 cpu_scale=0 ppa_fail=0 diag=2",
+            "I (6000) tab5_lcd: frames sent=40 cpu_scale=40 ppa_fail=0",
+            "I (11000) tab5_lcd: frames sent=41 cpu_scale=41 ppa_fail=0",
         ]
         self.assertEqual(capture.summarize("\n".join(lines)), (0, lines))
 

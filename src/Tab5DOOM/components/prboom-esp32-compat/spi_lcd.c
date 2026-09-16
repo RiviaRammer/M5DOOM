@@ -50,14 +50,6 @@ static const char *TAG = "tab5_lcd";
 static SemaphoreHandle_t frameMutex;
 static lv_display_t *doom_disp;
 static lv_obj_t *doom_img;
-static lv_obj_t *diagnostic_label;
-/* Updated and consumed by the Doom task, never by the LVGL task. */
-static unsigned diagnostic_mode;
-static bool diagnostic_pattern_pending;
-static bool diagnostic_refresh_pending;
-static const char *diagnostic_names[] = {
-    "T: display test", "TEST 1: STATIC REDRAW", "TEST 2: STATIC HOLD"
-};
 static uint16_t *scaled_fb[3];
 static uint32_t *native_fb;
 static ppa_client_handle_t scale_ppa;
@@ -122,7 +114,7 @@ static void tab5_lcd_log_stats(TickType_t now)
     ESP_LOGI(TAG,
              "frames sent=%" PRIu32 " skipped=%" PRIu32
              " window=%" PRIu32 "ms fps=%" PRIu32 ".%02" PRIu32
-             " cpu_scale=%" PRIu32 " ppa_fail=%" PRIu32 " diag=%u"
+             " cpu_scale=%" PRIu32 " ppa_fail=%" PRIu32
              " scale=%" PRIu64 "/%" PRIu32 "us refresh=%" PRIu64 "/%" PRIu32
              "us free_int=%u free_psram=%u",
              sent_frames,
@@ -132,7 +124,6 @@ static void tab5_lcd_log_stats(TickType_t now)
              fps_x100 % 100,
              cpu_scaled_frames,
              ppa_failures,
-             diagnostic_mode,
              processed_frames ? scale_time_total_us / processed_frames : 0,
              scale_time_max_us,
              sent_frames ? refresh_time_total_us / sent_frames : 0,
@@ -227,25 +218,9 @@ static void tab5_lcd_schedule_next_frame(TickType_t now)
     next_frame_tick = tab5_next_frame_tick(next_frame_tick, now, interval);
 }
 
-void spi_lcd_cycle_diagnostic(void)
-{
-    diagnostic_mode = (diagnostic_mode + 1) % 3;
-    if (diagnostic_mode == 1) {
-        diagnostic_pattern_pending = true;
-    }
-    diagnostic_refresh_pending = true;
-    frame_deadline_valid = false;
-    ESP_LOGI(TAG, "Display diagnostic: %s; T advances mode", diagnostic_names[diagnostic_mode]);
-}
-
 bool spi_lcd_frame_due(void)
 {
     TickType_t now = xTaskGetTickCount();
-
-    if (diagnostic_mode == 2 && !diagnostic_refresh_pending) {
-        tab5_lcd_log_stats(now);
-        return false;
-    }
 
     if (frame_deadline_valid && (int32_t)(now - next_frame_tick) < 0) {
         skipped_frames++;
@@ -270,10 +245,6 @@ void spi_lcd_send(const uint8_t *scr)
     if (!scaled_fb[0] || !scaled_fb[1] || !scaled_fb[2] || !doom_img) {
         return;
     }
-    if (diagnostic_mode == 2 && !diagnostic_refresh_pending) {
-        return;
-    }
-
     if (frame_deadline_valid && (int32_t)(now - next_frame_tick) < 0) {
         skipped_frames++;
         tab5_lcd_log_stats(now);
@@ -282,17 +253,11 @@ void spi_lcd_send(const uint8_t *scr)
     tab5_lcd_schedule_next_frame(now);
 
     xSemaphoreTake(frameMutex, portMAX_DELAY);
-    int next_fb_idx = diagnostic_mode && !diagnostic_pattern_pending ?
-        scaled_fb_idx : (scaled_fb_idx + 1) % 3;
+    int next_fb_idx = (scaled_fb_idx + 1) % 3;
     uint16_t *dst_fb = scaled_fb[next_fb_idx];
     int64_t scale_start_us = esp_timer_get_time();
 
-    if (diagnostic_mode) {
-        if (diagnostic_pattern_pending) {
-            tab5_display_test_pattern(dst_fb);
-            diagnostic_pattern_pending = false;
-        }
-    } else if (!tab5_lcd_scale_ppa(scr, dst_fb)) {
+    if (!tab5_lcd_scale_ppa(scr, dst_fb)) {
         tab5_lcd_scale_cpu(scr, dst_fb);
         cpu_scaled_frames++;
     }
@@ -307,9 +272,6 @@ void spi_lcd_send(const uint8_t *scr)
     if (bsp_display_lock(0)) {
         int64_t refresh_start_us = esp_timer_get_time();
         scaled_fb_idx = next_fb_idx;
-        if (diagnostic_refresh_pending) {
-            lv_label_set_text(diagnostic_label, diagnostic_names[diagnostic_mode]);
-        }
 #if LVGL_VERSION_MAJOR >= 9
         lv_image_set_src(doom_img, &doom_img_dsc[scaled_fb_idx]);
         lv_obj_invalidate(doom_img);
@@ -318,7 +280,6 @@ void spi_lcd_send(const uint8_t *scr)
         lv_obj_invalidate(doom_img);
 #endif
         lv_refr_now(doom_disp);
-        diagnostic_refresh_pending = false;
         uint32_t refresh_time_us = (uint32_t)(esp_timer_get_time() - refresh_start_us);
         refresh_time_total_us += refresh_time_us;
         if (refresh_time_us > refresh_time_max_us) {
@@ -430,10 +391,6 @@ void spi_lcd_init()
         lv_img_set_src(doom_img, &doom_img_dsc[scaled_fb_idx]);
 #endif
         lv_obj_align(doom_img, LV_ALIGN_CENTER, 0, 0);
-        diagnostic_label = lv_label_create(screen);
-        lv_label_set_text(diagnostic_label, diagnostic_names[0]);
-        lv_obj_set_style_text_color(diagnostic_label, lv_color_white(), LV_PART_MAIN);
-        lv_obj_align(diagnostic_label, LV_ALIGN_BOTTOM_MID, 0, -12);
         bsp_display_unlock();
     }
 

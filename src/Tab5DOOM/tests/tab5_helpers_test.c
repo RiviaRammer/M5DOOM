@@ -78,37 +78,6 @@ static void test_scale(void)
     free(src);
 }
 
-static void test_display_pattern(void)
-{
-    const unsigned width = TAB5_DOOM_HEIGHT * TAB5_DOOM_SCALE;
-    const unsigned height = TAB5_DOOM_WIDTH * TAB5_DOOM_SCALE;
-    const unsigned count = width * height;
-    uint16_t *allocation = malloc((count + 2) * sizeof(*allocation));
-    assert(allocation);
-    allocation[0] = 0x1234;
-    allocation[count + 1] = 0xabcd;
-    uint16_t *dst = allocation + 1;
-    tab5_display_test_pattern(dst);
-    const uint16_t expected_bars[] = {
-        0xffff, 0xffe0, 0x07ff, 0x07e0, 0xf81f, 0xf800, 0x001f, 0x8410
-    };
-    for (unsigned y = 0; y < height; y++) {
-        for (unsigned x = 0; x < width; x++) {
-            uint16_t expected;
-            if (x < 4 || x + 4 >= width || y < 4 || y + 4 >= height) {
-                expected = 0xffff;
-            } else if (y < height / 2) {
-                expected = expected_bars[x / (width / 8)];
-            } else {
-                expected = ((x / 60) % 2 != (y / 60) % 2) ? 0x4208 : 0xbdf7;
-            }
-            assert(dst[y * width + x] == expected);
-        }
-    }
-    assert(allocation[0] == 0x1234 && allocation[count + 1] == 0xabcd);
-    free(allocation);
-}
-
 static void test_deadlines(void)
 {
     for (uint32_t interval = 1; interval <= 20; interval++) {
@@ -141,8 +110,7 @@ int main(void)
 {
     test_keys();
     test_scale();
-    test_display_pattern();
     test_deadlines();
-    puts("PASS: physical-key aggregation, RGB565 scaling, display pattern, frame deadlines");
+    puts("PASS: physical-key aggregation, RGB565 scaling, frame deadlines");
     return 0;
 }
